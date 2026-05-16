@@ -72,6 +72,31 @@ pub struct Agent {
     /// `start_channels`; this is the alternate path for environments that
     /// build an Agent directly without `start_channels`.
     channel_handles: AgentChannelHandles,
+    /// Provider configuration captured at construction time, so a
+    /// `model_switch` tool call inside `turn_streamed` can rebuild a
+    /// provider with the same credentials, base URL, reliability config,
+    /// and runtime options the agent was originally configured with.
+    /// `None` for agents built without this configuration (test-only
+    /// builder paths); model switches are skipped in that case.
+    provider_switch_config: Option<ProviderSwitchConfig>,
+}
+
+/// Inputs needed to rebuild a provider mid-turn when the `model_switch`
+/// tool requests a different provider/model. Mirrors the inputs
+/// `Agent::from_config` passes to `create_routed_provider_with_options`.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderSwitchConfig {
+    /// Credential resolved from the configured fallback provider entry.
+    pub api_key: Option<String>,
+    /// Base URL override resolved from the configured fallback provider entry.
+    pub base_url: Option<String>,
+    /// Reliability config the agent was started with.
+    pub reliability: zeroclaw_config::schema::ReliabilityConfig,
+    /// Provider routes — used to pick up route-specific `api_key` for the
+    /// switched provider/model.
+    pub model_routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
+    /// Provider runtime options the agent was started with.
+    pub provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -154,6 +179,7 @@ pub struct AgentBuilder {
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
+    provider_switch_config: Option<ProviderSwitchConfig>,
 }
 
 impl Default for AgentBuilder {
@@ -193,6 +219,7 @@ impl AgentBuilder {
             activated_tools: None,
             hook_runner: None,
             approval_manager: None,
+            provider_switch_config: None,
         }
     }
 
@@ -354,6 +381,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn provider_switch_config(mut self, cfg: ProviderSwitchConfig) -> Self {
+        self.provider_switch_config = Some(cfg);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -417,6 +449,7 @@ impl AgentBuilder {
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             channel_handles: AgentChannelHandles::default(),
+            provider_switch_config: self.provider_switch_config,
         })
     }
 }
@@ -817,6 +850,17 @@ impl Agent {
                 None
             })
             .approval_manager(Some(Arc::new(approval_manager)))
+            .provider_switch_config(ProviderSwitchConfig {
+                api_key: fallback_provider_ag
+                    .and_then(|e| e.api_key.as_deref())
+                    .map(ToString::to_string),
+                base_url: fallback_provider_ag
+                    .and_then(|e| e.base_url.as_deref())
+                    .map(ToString::to_string),
+                reliability: config.reliability.clone(),
+                model_routes: config.providers.model_routes.clone(),
+                provider_runtime_options: provider_runtime_options.clone(),
+            })
             .build()?;
 
         agent.channel_handles = AgentChannelHandles {
@@ -1142,6 +1186,95 @@ impl Agent {
         futures_util::future::join_all(futs).await
     }
 
+    /// If the `model_switch` tool set a pending switch request in the
+    /// process-wide `MODEL_SWITCH_REQUEST` state, attempt to apply it.
+    ///
+    /// Returns `Some(new_effective_model)` when both:
+    /// - a switch is pending and differs from the current
+    ///   `(provider_name, current_effective_model)`, and
+    /// - a replacement provider was built successfully using the
+    ///   `provider_switch_config` captured at construction time.
+    ///
+    /// On any other path (no pending switch, identical switch,
+    /// missing `provider_switch_config`, or provider build failure) the
+    /// agent state is left untouched and the caller continues with the
+    /// existing provider/model. The pending switch request is always
+    /// cleared after observation so a failed switch does not retrigger
+    /// on the next iteration.
+    fn try_apply_pending_model_switch(&mut self, current_effective_model: &str) -> Option<String> {
+        let pending = crate::agent::loop_::get_model_switch_state()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())?;
+        let (new_provider, new_model) = pending;
+
+        // Same-provider, same-model: nothing to do. Still clear the
+        // request so a stale equal-value entry does not linger.
+        if new_provider == self.provider_name && new_model == current_effective_model {
+            crate::agent::loop_::clear_model_switch_request();
+            return None;
+        }
+
+        tracing::info!(
+            "Model switch detected in turn_streamed: {} {} -> {} {}",
+            self.provider_name,
+            current_effective_model,
+            new_provider,
+            new_model
+        );
+
+        let switch_outcome: anyhow::Result<Box<dyn Provider>> =
+            if let Some(ref cfg) = self.provider_switch_config {
+                // Prefer a route-specific api_key when the switched
+                // provider/model matches a configured model_route entry.
+                let route_api_key = cfg
+                    .model_routes
+                    .iter()
+                    .find(|r| {
+                        r.provider.eq_ignore_ascii_case(&new_provider)
+                            && (r.model.eq_ignore_ascii_case(&new_model)
+                                || r.hint.eq_ignore_ascii_case(&new_model))
+                    })
+                    .and_then(|r| r.api_key.as_deref());
+                let api_key = route_api_key.or(cfg.api_key.as_deref());
+                zeroclaw_providers::create_routed_provider_with_options(
+                    &new_provider,
+                    api_key,
+                    cfg.base_url.as_deref(),
+                    &cfg.reliability,
+                    &cfg.model_routes,
+                    &new_model,
+                    &cfg.provider_runtime_options,
+                )
+            } else {
+                Err(anyhow::anyhow!(
+                    "model_switch requested but agent has no provider_switch_config; \
+                     cannot rebuild provider safely"
+                ))
+            };
+
+        let result = match switch_outcome {
+            Ok(new_prov) => {
+                // Commit state only after the provider was built
+                // successfully.
+                self.provider = new_prov;
+                self.provider_name = new_provider;
+                self.model_name = new_model.clone();
+                Some(new_model)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to apply model_switch in turn_streamed; staying on {} {}: {e}",
+                    self.provider_name,
+                    current_effective_model,
+                );
+                None
+            }
+        };
+        crate::agent::loop_::clear_model_switch_request();
+        result
+    }
+
     fn classify_model(&self, user_message: &str) -> String {
         if let Some(decision) =
             super::classifier::classify_with_decision(&self.classification_config, user_message)
@@ -1403,7 +1536,7 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        let mut effective_model = self.classify_model(user_message);
         let turn_started_at = Instant::now();
         self.observer.record_event(&ObserverEvent::AgentStart {
             provider: self.provider_name.clone(),
@@ -1833,6 +1966,11 @@ impl Agent {
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
+
+            if let Some(new_effective_model) = self.try_apply_pending_model_switch(&effective_model)
+            {
+                effective_model = new_effective_model;
+            }
         }
 
         self.observer.record_event(&ObserverEvent::AgentEnd {
@@ -3980,6 +4118,120 @@ mod tests {
         assert_eq!(
             names,
             &["file_read", "web_fetch", "ops.deploy", "ops.rollback"]
+        );
+    }
+
+    // ── model_switch persistence (#6173) ─────────────────────────────
+    //
+    // `MODEL_SWITCH_REQUEST` is a process-wide static. Tests that read or
+    // write it serialize on this mutex so they don't race each other.
+    static MODEL_SWITCH_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn build_test_agent(
+        initial_provider_name: &str,
+        initial_model_name: &str,
+        switch_config: Option<ProviderSwitchConfig>,
+    ) -> Agent {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut builder = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .provider_name(initial_provider_name.to_string())
+            .model_name(initial_model_name.to_string());
+        if let Some(cfg) = switch_config {
+            builder = builder.provider_switch_config(cfg);
+        }
+        builder.build().expect("agent builder")
+    }
+
+    #[test]
+    fn try_apply_pending_model_switch_noop_when_no_pending_request() {
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
+        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        assert_eq!(result, None);
+        assert_eq!(agent.provider_name, "openai");
+        assert_eq!(agent.model_name, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn try_apply_pending_model_switch_noop_when_identical_to_current() {
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        // Pre-set an "equal" switch request.
+        {
+            let state = crate::agent::loop_::get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("openai".to_string(), "gpt-4o-mini".to_string()));
+        }
+
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
+        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        assert_eq!(result, None, "same-provider/same-model is a no-op");
+        // State must be cleared so a stale equal entry does not linger.
+        let still_pending = crate::agent::loop_::get_model_switch_state()
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            still_pending, None,
+            "equal switch request must be cleared after observation"
+        );
+    }
+
+    #[test]
+    fn try_apply_pending_model_switch_preserves_state_without_switch_config() {
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        // Pre-set a real switch request.
+        {
+            let state = crate::agent::loop_::get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("anthropic".to_string(), "claude-haiku".to_string()));
+        }
+
+        // Agent has NO provider_switch_config — cannot rebuild provider.
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
+        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+
+        // Returns None (failed switch), state unchanged on the agent,
+        // pending request cleared so we don't retry forever.
+        assert_eq!(result, None);
+        assert_eq!(
+            agent.provider_name, "openai",
+            "provider_name must NOT change when provider rebuild is not possible"
+        );
+        assert_eq!(
+            agent.model_name, "gpt-4o-mini",
+            "model_name must NOT change when provider rebuild is not possible"
+        );
+        let still_pending = crate::agent::loop_::get_model_switch_state()
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            still_pending, None,
+            "pending switch must be cleared even when rebuild fails, \
+             so it does not retrigger on the next iteration"
         );
     }
 }

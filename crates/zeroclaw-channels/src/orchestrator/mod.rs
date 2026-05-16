@@ -3510,7 +3510,13 @@ async fn process_channel_message(
                 ) => LlmExecutionResult::Completed(result),
             };
 
-            // Handle model switch: re-create the provider and retry
+            // Handle model switch: re-create the provider and retry.
+            //
+            // Resolves the new provider+model through `ctx.model_routes` so a
+            // route-specific `api_key` is picked up, then reuses
+            // `get_or_create_provider` so the new provider lands in the
+            // cache (consistent with the normal route-selection path) and is
+            // built with the proper credentials.
             if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result
                 && let Some((new_provider, new_model)) = is_model_switch_requested(e)
             {
@@ -3522,20 +3528,49 @@ async fn process_channel_message(
                     new_model
                 );
 
-                match create_resilient_provider_nonblocking(
+                // Resolve route-specific api_key by matching the new model
+                // against `model_routes` (the same lookup the `/model`
+                // command uses). Falls back to None so `get_or_create_provider`
+                // uses the global key from `ctx.api_key`.
+                let resolved_api_key = ctx
+                    .model_routes
+                    .iter()
+                    .find(|r| {
+                        r.provider.eq_ignore_ascii_case(&new_provider)
+                            && (r.model.eq_ignore_ascii_case(&new_model)
+                                || r.hint.eq_ignore_ascii_case(&new_model))
+                    })
+                    .and_then(|r| r.api_key.clone());
+
+                match get_or_create_provider(
+                    ctx.as_ref(),
                     &new_provider,
-                    ctx.api_key.clone(),
-                    ctx.api_url.clone(),
-                    ctx.reliability.as_ref().clone(),
-                    ctx.provider_runtime_options.clone(),
+                    resolved_api_key.as_deref(),
                 )
                 .await
                 {
                     Ok(new_prov) => {
-                        active_provider = Arc::from(new_prov);
+                        // Commit state only after the provider was built
+                        // successfully, so a failure leaves the turn on the
+                        // original provider/model pair instead of a
+                        // half-switched state.
+                        active_provider = new_prov;
                         route.provider = new_provider;
                         route.model = new_model;
+                        route.api_key = resolved_api_key;
                         clear_model_switch_request();
+
+                        // Persist the route override so subsequent messages
+                        // from this sender continue using the switched model.
+                        set_route_selection(
+                            ctx.as_ref(),
+                            &history_key,
+                            ChannelRouteSelection {
+                                provider: route.provider.clone(),
+                                model: route.model.clone(),
+                                api_key: route.api_key.clone(),
+                            },
+                        );
 
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             provider: route.provider.clone(),
